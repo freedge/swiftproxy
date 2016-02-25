@@ -68,6 +68,7 @@ import javax.ws.rs.core.Response;
 import com.bouncestorage.swiftproxy.BlobStoreResource;
 import com.bouncestorage.swiftproxy.COPY;
 import com.bouncestorage.swiftproxy.Utils;
+import com.bouncestorage.swiftproxy.v1.ContainerResource.ObjectEntry;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Joiner;
@@ -169,7 +170,7 @@ public final class ObjectResource extends BlobStoreResource {
 
     @GET
     public Response getObject(@NotNull @PathParam("container") String container,
-                              @NotNull @Encoded @PathParam("object") String object,
+                              @NotNull @Encoded @PathParam("object")  String object,
                               @NotNull @PathParam("account") String account,
                               @HeaderParam("X-Auth-Token") String authToken,
                               @HeaderParam("X-Newest") boolean newest,
@@ -177,17 +178,56 @@ public final class ObjectResource extends BlobStoreResource {
                               @QueryParam("expires") String expires,
                               @QueryParam("multipart-manifest") String multiPartManifest,
                               @HeaderParam("Range") String range,
+                              @HeaderParam("Accept") Optional<String> accept,
+                              @HeaderParam("CurrentVersion") Optional<String> currentVersion,
                               @HeaderParam("If-Match") String ifMatch,
                               @HeaderParam("If-None-Match") String ifNoneMatch,
-                              @HeaderParam("If-Modified-Since") Date ifModifiedSince,
+                              @HeaderParam("If-Modified-Since") Date ifModifiedSince,                              
                               @HeaderParam("If-Unmodified-Since") Date ifUnmodifiedSince) {
         logger.debug("GET account={} container={} object={}", account, container, object);
-        BlobStore blobStore = getBlobStore(authToken).get(container, object);
-
-        if (!blobStore.containerExists(container)) {
-            return notFound();
+        BlobStore containerStore = getBlobStore(authToken).get(container);
+        if (!containerStore.containerExists(container)) {
+        	return notFound();
         }
-
+        
+        if (accept.isPresent() && currentVersion.isPresent()) {
+        	final String inputObject = object;
+            ListContainerOptions options = new ListContainerOptions();
+            options.withDetails();
+        	StorageMetadata md = StreamSupport.stream(
+                    Utils.crawlBlobStore(containerStore, container, options).spliterator(), false)
+                    .peek(meta -> logger.info("meta: {}", meta))
+                    .filter(meta -> meta.getUserMetadata().containsKey("version"))
+                    .filter(meta -> meta.getName().startsWith(inputObject))
+                    .max((meta1, meta2) -> Integer.compare(
+                    		Integer.parseInt(meta1.getUserMetadata().get("version")),
+                    		Integer.parseInt(meta2.getUserMetadata().get("version"))
+            		)).get();
+        	object = md.getName();
+        	if (accept.get().contains("SQLiteDF")) {
+        		// check if the delta exists for this version
+            	Optional<StorageMetadata> md2 = StreamSupport.stream(
+                        Utils.crawlBlobStore(containerStore, container, options).spliterator(), false)
+                        .peek(meta -> logger.info("meta: {}", meta))
+                        //.filter(meta -> (prefix == null || meta.getName().startsWith(prefix)))
+                        //.filter(meta -> delimFilter(meta.getName(), delim_filter))
+                        .filter(meta -> meta.getUserMetadata().containsKey("fromversion")
+                        		&& meta.getUserMetadata().containsKey("version")
+                        		&& meta.getUserMetadata().get("fromversion").equals(currentVersion)
+                        		&& meta.getUserMetadata().get("version").equals(md.getUserMetadata().get("version"))
+                        		)
+                        .findFirst();
+            	if (md2.isPresent()) {
+            		object = md2.get().getName();
+            	}            	
+        	}       	        
+        }
+        
+        BlobStore blobStore = getBlobStore(authToken).get(container, object);
+        if (!blobStore.containerExists(container)) {        
+        	return notFound();
+        }
+        
         GetOptions options = new GetOptions();
         List<Pair<Long, Long>> ranges = null;
         if (range != null) {
@@ -209,6 +249,8 @@ public final class ObjectResource extends BlobStoreResource {
         if (ifUnmodifiedSince != null) {
             options.ifUnmodifiedSince(ifUnmodifiedSince);
         }
+        
+
 
         return getObject(blobStore, container, object, options, ranges, "get".equals(multiPartManifest));
     }
@@ -300,6 +342,12 @@ public final class ObjectResource extends BlobStoreResource {
                 }
             }
             meta = blob.getMetadata();
+            
+            Response cond = conditionalGetSatisified(options,
+                    meta.getETag(), meta.getLastModified());
+            if (cond != null) {
+                return cond;
+            }
         }
 
         try {
@@ -470,7 +518,7 @@ public final class ObjectResource extends BlobStoreResource {
             ContentMetadata contentMetadata = meta.getContentMetadata();
             Map newMetadata = new HashMap<>();
             newMetadata.putAll(meta.getUserMetadata());
-            newMetadata.putAll(options.getUserMetadata().or(ImmutableMap.of()));
+//            newMetadata.putAll(options.getUserMetadata().or(ImmutableMap.of()));
             RESERVED_METADATA.forEach(s -> newMetadata.remove(s));
             Blob blob = blobStore.blobBuilder(destObject)
                     .userMetadata(newMetadata)
@@ -570,7 +618,7 @@ public final class ObjectResource extends BlobStoreResource {
                 options = CopyOptions.NONE;
             } else {
                 Map newMetadata = new HashMap<>();
-                newMetadata.putAll(meta.getUserMetadata());
+//                newMetadata.putAll(meta.getUserMetadata());
                 newMetadata.putAll(additionalUserMeta);
 
                 options = CopyOptions.builder()
@@ -578,7 +626,7 @@ public final class ObjectResource extends BlobStoreResource {
                         .build();
             }
         }
-        validateUserMetadata(options.getUserMetadata().orNull());
+//        validateUserMetadata(options.getUserMetadata().orNull());
 
         Map<String, String> userMetadata = meta.getUserMetadata();
         String etag = null;
